@@ -1,2 +1,5 @@
 .DS_Store
 .idea
+cmd/oneproxy/oneproxy.crt
+cmd/oneproxy/oneproxy.key
+cmd/oneproxy/oneproxy
