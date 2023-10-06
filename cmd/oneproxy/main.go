@@ -4,10 +4,12 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +20,10 @@ import (
 	"github.com/AdguardTeam/gomitmproxy/proxyutil"
 
 	_ "net/http/pprof"
+)
+
+var (
+	tmpDir = "/tmp/"
 )
 
 func main() {
@@ -61,7 +67,7 @@ func main() {
 	proxy := gomitmproxy.NewProxy(gomitmproxy.Config{
 		ListenAddr: addr,
 
-		APIHost:  "gomitmproxy",
+		APIHost: "gomitmproxy",
 
 		MITMConfig:     mitmConfig,
 		MITMExceptions: []string{"example.com"},
@@ -104,53 +110,47 @@ func onRequest(session *gomitmproxy.Session) (*http.Request, *http.Response) {
 		return nil, res
 	}
 
+	if req.URL.Path != "" && req.Method != http.MethodConnect {
+		_, name := path.Split(req.URL.Path)
+		session.SetProp("saveName", name)
+	}
+
 	return nil, nil
 }
 
+func fixName(session *gomitmproxy.Session, name interface{}) string {
+	fname := session.ID() + "-" + name.(string)
+	log.Debug("onResponse: write file name: %s %s %s", fname, session.Request().RequestURI, session.Request().Method)
+	return fname
+}
+
 func onResponse(session *gomitmproxy.Session) *http.Response {
-	log.Printf("onResponse: %s", session.Request().URL.String())
-
-	/*
-	if _, ok := session.GetProp("blocked"); ok {
-		log.Printf("onResponse: was blocked")
-		return nil
-	}
-
 	res := session.Response()
 	req := session.Request()
+	log.Printf("onResponse: %s", req.URL.String())
 
-	if strings.Index(res.Header.Get("Content-Type"), "text/html") != 0 {
-		// Do nothing with non-HTML responses
+	name, ok := session.GetProp("saveName")
+	if !ok {
 		return nil
 	}
-
-	b, err := proxyutil.ReadDecompressedBody(res)
-	// Close the original body.
-	_ = res.Body.Close()
+	dumpFile, err := os.Create(fixName(session, name))
 	if err != nil {
 		return proxyutil.NewErrorResponse(req, err)
 	}
+	origBody := res.Body
+	pr, pw := io.Pipe()
+	res.Body = pr
+	multi := io.MultiWriter(dumpFile, pw)
+	go func() {
+		if _, err = io.Copy(multi, origBody); err != nil {
+			log.Printf("onResponse: copy multi fail: %s", err.Error())
+		}
+		origBody.Close()
+		dumpFile.Close()
+		pw.Close()
+	}()
 
-	// Use latin1 before modifying the body. Using this 1-byte encoding will
-	// let us preserve all original characters regardless of what exactly is
-	// the encoding.
-	body, err := proxyutil.DecodeLatin1(bytes.NewReader(b))
-	if err != nil {
-		return proxyutil.NewErrorResponse(session.Request(), err)
-	}
-
-	// Modifying the original body.
-	modifiedBody, err := proxyutil.EncodeLatin1(body + "<!-- EDITED -->")
-	if err != nil {
-		return proxyutil.NewErrorResponse(session.Request(), err)
-	}
-
-	res.Body = io.NopCloser(bytes.NewReader(modifiedBody))
-	res.Header.Del("Content-Encoding")
-	res.ContentLength = int64(len(modifiedBody))
-	*/
-
-	return nil
+	return res
 }
 
 func onConnect(_ *gomitmproxy.Session, _ string, addr string) (conn net.Conn) {
