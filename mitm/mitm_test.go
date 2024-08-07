@@ -61,3 +61,4 @@ func TestMITM(t *testing.T) {
 	assert.Equal(t, 1, len(x509c.IPAddresses))
 	assert.True(t, net.ParseIP("192.168.0.1").Equal(x509c.IPAddresses[0]))
 }
+

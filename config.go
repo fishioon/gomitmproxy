@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"net/url"
 
 	"github.com/AdguardTeam/gomitmproxy/mitm"
 )
@@ -83,4 +84,6 @@ type Config struct {
 	// OnError is called if there's an issue with retrieving the response from
 	// the remote server.
 	OnError OnErrorFunc
+
+	NextProxy func(*http.Request) (*url.URL, error)
 }

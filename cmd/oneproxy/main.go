@@ -1,16 +1,19 @@
+// oneproxy for proxy any
 package main
 
 import (
+	"bytes"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
-	"strings"
 	"syscall"
 	"time"
 
@@ -18,26 +21,21 @@ import (
 	"github.com/AdguardTeam/gomitmproxy"
 	"github.com/AdguardTeam/gomitmproxy/mitm"
 	"github.com/AdguardTeam/gomitmproxy/proxyutil"
-
-	_ "net/http/pprof"
 )
 
 var (
-	tmpDir = "/tmp/"
+	dumpRequestDir = "/tmp/oneproxy/"
+	proxyCache     = make(map[string]bool)
+	nextProxy, _   = url.Parse("socks5://127.0.0.1:1080")
 )
 
 func main() {
-	log.SetLevel(log.DEBUG)
-
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
-
 	// Read the MITM cert and key.
 	tlsCert, err := tls.LoadX509KeyPair("oneproxy.crt", "oneproxy.key")
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	privateKey := tlsCert.PrivateKey.(*rsa.PrivateKey)
 
 	x509c, err := x509.ParseCertificate(tlsCert.Certificate[0])
@@ -45,10 +43,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	mitmConfig, err := mitm.NewConfig(x509c, privateKey, &CustomCertsStorage{
-		certsCache: map[string]*tls.Certificate{}},
-	)
-
+	mitmConfig, err := mitm.NewConfig(x509c, privateKey, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -70,11 +65,12 @@ func main() {
 		APIHost: "gomitmproxy",
 
 		MITMConfig:     mitmConfig,
-		MITMExceptions: []string{"example.com"},
+		MITMExceptions: []string{"example.com", "gateway.icloud.com.cn"},
 
 		OnRequest:  onRequest,
 		OnResponse: onResponse,
 		OnConnect:  onConnect,
+		NextProxy:  proxyFunc,
 	})
 
 	err = proxy.Start()
@@ -95,18 +91,12 @@ func onRequest(session *gomitmproxy.Session) (*http.Request, *http.Response) {
 
 	log.Printf("onRequest: %s %s", req.Method, req.URL.String())
 
-	if req.URL.Host == "example.net" {
-		body := strings.NewReader("<html><body><h1>Replaced response</h1></body></html>")
+	if req.URL.Host == "oneproxy.io" {
+		b, _ := json.Marshal(proxyCache)
+		body := bytes.NewReader(b)
 		res := proxyutil.NewResponse(http.StatusOK, body, req)
 		res.Header.Set("Content-Type", "text/html")
 		session.SetProp("blocked", true)
-		return nil, res
-	}
-
-	if req.URL.Host == "testgomitmproxy" {
-		body := strings.NewReader("<html><body><h1>Served by gomitmproxy</h1></body></html>")
-		res := proxyutil.NewResponse(http.StatusOK, body, req)
-		res.Header.Set("Content-Type", "text/html")
 		return nil, res
 	}
 
@@ -119,7 +109,7 @@ func onRequest(session *gomitmproxy.Session) (*http.Request, *http.Response) {
 }
 
 func fixName(session *gomitmproxy.Session, name interface{}) string {
-	fname := session.ID() + "-" + name.(string)
+	fname := dumpRequestDir + session.ID() + "-" + name.(string)
 	log.Debug("onResponse: write file name: %s %s %s", fname, session.Request().RequestURI, session.Request().Method)
 	return fname
 }
@@ -128,6 +118,11 @@ func onResponse(session *gomitmproxy.Session) *http.Response {
 	res := session.Response()
 	req := session.Request()
 	log.Printf("onResponse: %s", req.URL.String())
+	if res.StatusCode == http.StatusBadGateway && nextProxy != nil {
+		log.Info("proxy: request error, add next proxy cache: %s", req.Host)
+		proxyCache[req.Host] = true
+		return nil
+	}
 
 	name, ok := session.GetProp("saveName")
 	if !ok {
@@ -137,20 +132,35 @@ func onResponse(session *gomitmproxy.Session) *http.Response {
 	if err != nil {
 		return proxyutil.NewErrorResponse(req, err)
 	}
-	origBody := res.Body
-	pr, pw := io.Pipe()
-	res.Body = pr
-	multi := io.MultiWriter(dumpFile, pw)
-	go func() {
-		if _, err = io.Copy(multi, origBody); err != nil {
-			log.Printf("onResponse: copy multi fail: %s", err.Error())
-		}
-		origBody.Close()
-		dumpFile.Close()
-		pw.Close()
-	}()
+
+	res.Body = TeeReader(res.Body, dumpFile)
 
 	return res
+}
+
+func TeeReader(r io.ReadCloser, w io.WriteCloser) io.ReadCloser {
+	return &teeReader{r, w}
+}
+
+type teeReader struct {
+	r io.ReadCloser
+	w io.WriteCloser
+}
+
+func (t *teeReader) Read(p []byte) (n int, err error) {
+	n, err = t.r.Read(p)
+	if n > 0 {
+		if n, err := t.w.Write(p[:n]); err != nil {
+			return n, err
+		}
+	}
+	return
+}
+
+func (t *teeReader) Close() error {
+	t.r.Close()
+	t.w.Close()
+	return nil
 }
 
 func onConnect(_ *gomitmproxy.Session, _ string, addr string) (conn net.Conn) {
@@ -164,20 +174,10 @@ func onConnect(_ *gomitmproxy.Session, _ string, addr string) (conn net.Conn) {
 	return nil
 }
 
-// CustomCertsStorage is an example of a custom cert storage.
-type CustomCertsStorage struct {
-	// certsCache is a cache with the generated certificates.
-	certsCache map[string]*tls.Certificate
-}
-
-// Get gets the certificate from the storage.
-func (c *CustomCertsStorage) Get(key string) (cert *tls.Certificate, ok bool) {
-	cert, ok = c.certsCache[key]
-
-	return cert, ok
-}
-
-// Set saves the certificate to the storage.
-func (c *CustomCertsStorage) Set(key string, cert *tls.Certificate) {
-	c.certsCache[key] = cert
+func proxyFunc(req *http.Request) (*url.URL, error) {
+	if proxyCache[req.Host] {
+		log.Info("proxy on: [%s] [%s]", req.Host, nextProxy.String())
+		return nextProxy, nil
+	}
+	return nil, nil
 }
